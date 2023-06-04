@@ -51,6 +51,7 @@ async function run() {
     const menuCollection = client.db("bistroDB").collection("menu");
     const reviewCollection = client.db("bistroDB").collection("reviews");
     const cartCollection = client.db("bistroDB").collection("carts");
+    const paymentCollection = client.db("bistroDB").collection("payments");
 
     app.post("/jwt", (req, res) => {
       const user = req.body;
@@ -88,7 +89,7 @@ async function run() {
 
     app.post("/users", async (req, res) => {
       const user = req.body;
-      console.log(user);
+      // console.log(user);
       const query = { email: user.email };
       const existingUser = await usersCollection.findOne(query);
       console.log("existing user", existingUser);
@@ -163,7 +164,7 @@ async function run() {
     // cart related apis
     app.get("/carts", verifyJWT, async (req, res) => {
       const email = req.query.email;
-      console.log(email);
+      // console.log(email);
 
       if (!email) {
         res.status(400).send("Email parameter is missing.");
@@ -184,7 +185,7 @@ async function run() {
 
     app.post("/carts", async (req, res) => {
       const item = req.body;
-      console.log(item);
+      // console.log(item);
       const result = await cartCollection.insertOne(item);
       res.send(result);
     });
@@ -197,9 +198,10 @@ async function run() {
     });
 
     // create payment intent
-    app.post("/create-payment-intent", async (req, res) => {
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
       const { price } = req.body;
-      const amount = price * 100;
+      const amount = parseInt(price * 100);
+      console.log(price, amount);
       const paymentIntent = await stripe.paymentIntents.create({
         amount: amount,
         currency: "usd",
@@ -208,6 +210,103 @@ async function run() {
       res.send({
         clientSecret: paymentIntent.client_secret,
       });
+    });
+
+    // payment related api
+    app.post("/payment", verifyJWT, async (req, res) => {
+      const payment = req.body;
+      const insertResult = await paymentCollection.insertOne(payment);
+
+      const query = {
+        _id: { $in: payment.cartItems.map((id) => new ObjectId(id)) },
+      };
+      const deleteResult = await cartCollection.deleteMany(query);
+
+      res.send({ insertResult, deleteResult });
+    });
+
+    app.get("/admin-stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const users = await usersCollection.estimatedDocumentCount();
+      const products = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+
+      // best way to get sum of a field is to use group and sum operator
+      /*
+      await paymentCollection.aggregate([
+        {
+          $group: {
+            _id: null,
+            total: { $sum: "$price" },
+          },
+        },
+        ]).toArray()     
+    */
+
+      const payments = await paymentCollection.find().toArray();
+      const revenue = payments.reduce((sum, payment) => sum + payment.price, 0);
+
+      res.send({
+        users,
+        products,
+        orders,
+        revenue,
+      });
+    });
+
+    /**
+     * -----------------
+     * BANGLA SYSTEM (second best solution)
+     * -----------------
+     * 1. load all payments
+     * 2. for each payment, get the menuItems array
+     * 3. for each items in the menuItem array get the menuItem from the menu
+     * collection
+     * 4. put them in an array: allOrderedItems
+     * 5. separate allOrderedItems by category using filter
+     * 6. now get the quantity by using length: pizzas.length
+     * 7. for each category use reduce to get the total amount spent on this
+     * category.
+     *
+     *
+     * **/
+    app.get("/order-stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const pipeline = [
+        {
+          $match: {}, // Add any desired match conditions here, if applicable
+        },
+        {
+          $unwind: "$menuItems",
+        },
+        {
+          $lookup: {
+            from: "menu",
+            localField: "menuItems",
+            foreignField: "_id",
+            as: "menuItemDetails",
+          },
+        },
+        {
+          $unwind: "$menuItemDetails",
+        },
+        {
+          $group: {
+            _id: "$menuItemDetails.category",
+            total: { $sum: "$menuItemDetails.price" },
+            itemCount: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            category: "$_id",
+            total: { $round: ["$total", 2] },
+            itemCount: 1,
+            _id: 0,
+          },
+        },
+      ];
+
+      const result = await paymentCollection.aggregate(pipeline).toArray();
+      res.send(result);
     });
 
     // Send a ping to confirm a successful connection
